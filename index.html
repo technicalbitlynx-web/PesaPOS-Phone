@@ -4465,7 +4465,7 @@
                 async migrate() {
                     const done = await PesaDB.getKV('apk_migrated_v1', false);
                     if (done) return;
-                    const tables = { products, sales, customers, expenses, suppliers, purchaseOrders, shifts };
+                    const tables = { products, sales, customers, expenses, suppliers, purchaseOrders };
                     for (const [t, rows] of Object.entries(tables)) {
                         if (rows?.length) await PesaDB.put(t, rows);
                     }
@@ -4561,7 +4561,7 @@
             function saveCustomers() { localStorage.setItem('profitpoint_customers', JSON.stringify(customers)); PesaDB.put('customers', customers); if (!_receivingSocketData) socketPushData({ customers }); }
             function saveSuppliers() { localStorage.setItem('profitpoint_suppliers', JSON.stringify(suppliers)); PesaDB.put('suppliers', suppliers); if (!_receivingSocketData) socketPushData({ suppliers }); }
             function savePurchaseOrders() { localStorage.setItem('profitpoint_purchase_orders', JSON.stringify(purchaseOrders)); PesaDB.put('purchaseOrders', purchaseOrders); }
-            function saveShifts()    { localStorage.setItem('profitpoint_shifts', JSON.stringify(shifts)); PesaDB.put('shifts', shifts); }
+            function saveShifts()    { localStorage.setItem('profitpoint_shifts', JSON.stringify(shifts)); }
             function saveAuditLogs() { localStorage.setItem('profitpoint_audit_logs', JSON.stringify(auditLogs)); }
             function saveNotifications() { localStorage.setItem('profitpoint_notifications', JSON.stringify(notifications)); }
             function saveUsers()     { localStorage.setItem(USERS_KEY, JSON.stringify(users)); PesaDB.put('users', users); }
