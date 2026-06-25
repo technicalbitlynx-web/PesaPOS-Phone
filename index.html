@@ -19,6 +19,8 @@
             onerror="var s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';document.head.appendChild(s);"></script>
     <script src="./web-assets/vendor/jspdf/jspdf.plugin.autotable.min.js"
             onerror="var s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js';document.head.appendChild(s);"></script>
+    <!-- Dexie.js — IndexedDB wrapper for hybrid local storage -->
+    <script src="./web-assets/vendor/dexie/dexie.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -4252,6 +4254,7 @@
                     } else if (d.device_info && d.device_info.registered) {
                         posDeviceType = d.device_info.device_type;
                         localStorage.setItem('pesa_device_type', posDeviceType);
+                        connectPosSocket();
                     }
                 } catch { /* offline — fall back to cached posDeviceType */ }
             }
@@ -4422,24 +4425,153 @@
                 renderDevices();
             }
 
+            // ==================== HYBRID STORAGE — PesaDB (IndexedDB via Dexie) ====================
+            const _apkDb = new Dexie('PesaPOS_APK_v1');
+            _apkDb.version(1).stores({
+                products:       'id, name, category, updatedAt',
+                sales:          'id, date, updatedAt',
+                customers:      'id, name, updatedAt',
+                expenses:       'id, date, updatedAt',
+                suppliers:      'id, name, updatedAt',
+                purchaseOrders: 'id, date, updatedAt',
+                shifts:         '++_seq, openedAt',
+                kv:             'key',
+                syncQueue:      '++id, table, ts',
+            });
+
+            const PesaDB = {
+                async put(table, data) {
+                    try {
+                        const arr = Array.isArray(data) ? data : [data];
+                        const ts = new Date().toISOString();
+                        await _apkDb[table].bulkPut(arr.map(r => ({ ...r, updatedAt: r.updatedAt || ts })));
+                    } catch (e) { console.warn('PesaDB.put', table, e.message); }
+                },
+                async getAll(table) {
+                    try { return await _apkDb[table].toArray(); } catch { return []; }
+                },
+                async merge(table, incoming) {
+                    if (!incoming?.length) return;
+                    const keys = incoming.map(r => r.id).filter(Boolean);
+                    if (!keys.length) { await PesaDB.put(table, incoming); return; }
+                    const existing = await _apkDb[table].bulkGet(keys);
+                    const toWrite = incoming.filter((r, i) => !existing[i] || (r.updatedAt || '') >= (existing[i].updatedAt || ''));
+                    if (toWrite.length) await _apkDb[table].bulkPut(toWrite);
+                },
+                async getKV(key, fallback) {
+                    try { const r = await _apkDb.kv.get(key); return r ? r.val : fallback; } catch { return fallback; }
+                },
+                async putKV(key, val) { try { await _apkDb.kv.put({ key, val }); } catch {} },
+                async migrate() {
+                    const done = await PesaDB.getKV('apk_migrated_v1', false);
+                    if (done) return;
+                    const tables = { products, sales, customers, expenses, suppliers, purchaseOrders, shifts };
+                    for (const [t, rows] of Object.entries(tables)) {
+                        if (rows?.length) await PesaDB.put(t, rows);
+                    }
+                    await PesaDB.putKV('apk_migrated_v1', true);
+                },
+            };
+
+            // ==================== REAL-TIME SOCKET SYNC ====================
+            let _posSocket = null;
+            let _receivingSocketData = false;
+
+            function connectPosSocket() {
+                if (!posmsUrl || !posmsKey) return;
+                if (_posSocket?.connected) return;
+                const base = posmsBase();
+                const doConnect = () => {
+                    if (typeof io === 'undefined' || _posSocket?.connected) return;
+                    _posSocket = io(base, {
+                        auth: { device_id: posDeviceId, license_key: posmsKey },
+                        transports: ['websocket', 'polling'],
+                        reconnection: true, reconnectionDelay: 5000,
+                    });
+                    _posSocket.on('connect', async () => {
+                        const queued = await _apkDb.syncQueue.toArray().catch(() => []);
+                        for (const item of queued) {
+                            try { socketPushData(JSON.parse(item.data), true); await _apkDb.syncQueue.delete(item.id); }
+                            catch { break; }
+                        }
+                    });
+                    _posSocket.on('pos:data-push', async (payload) => {
+                        _receivingSocketData = true;
+                        try {
+                            const { products: p, sales: s, customers: c, expenses: ex, suppliers: su } = payload;
+                            if (p?.length)  { await PesaDB.merge('products',  p);  products  = await PesaDB.getAll('products');  localStorage.setItem(STORAGE_PROD, JSON.stringify(products)); }
+                            if (s?.length)  { await PesaDB.merge('sales',     s);  sales     = await PesaDB.getAll('sales');     localStorage.setItem('profitpoint_sales', JSON.stringify(sales)); }
+                            if (c?.length)  { await PesaDB.merge('customers', c);  customers = await PesaDB.getAll('customers'); localStorage.setItem('profitpoint_customers', JSON.stringify(customers)); }
+                            if (ex?.length) { await PesaDB.merge('expenses',  ex); expenses  = await PesaDB.getAll('expenses');  localStorage.setItem('profitpoint_expenses', JSON.stringify(expenses)); }
+                            if (su?.length) { await PesaDB.merge('suppliers', su); suppliers = await PesaDB.getAll('suppliers'); localStorage.setItem('profitpoint_suppliers', JSON.stringify(suppliers)); }
+                            if (p?.length || s?.length || c?.length || ex?.length || su?.length) {
+                                showToast('Data synced from another device', 'info');
+                            }
+                        } catch (e) { console.warn('pos:data-push error', e.message); }
+                        _receivingSocketData = false;
+                    });
+                    _posSocket.on('pos:refresh', (payload) => {
+                        if (payload?.reason === 'device_reassigned' || payload?.reason === 'device_deregistered') {
+                            posDeviceType = null;
+                            localStorage.removeItem('pesa_device_type');
+                            if (typeof logout === 'function') logout();
+                        }
+                    });
+                    _posSocket.on('pos:message', (d) => showToast(d.message || 'Message from admin', 'info'));
+                };
+                if (typeof io !== 'undefined') { doConnect(); }
+                else {
+                    const s = document.createElement('script');
+                    s.src = `${base}/socket.io/socket.io.js`;
+                    s.onload = doConnect;
+                    s.onerror = () => console.warn('socket.io unavailable');
+                    document.head.appendChild(s);
+                }
+            }
+
+            function socketPushData(delta, skipQueue = false) {
+                if (_receivingSocketData) return;
+                if (!_posSocket?.connected) {
+                    if (!skipQueue) Object.entries(delta).forEach(([t, d]) => {
+                        if (d?.length) _apkDb.syncQueue.add({ table: t, data: JSON.stringify(d), ts: Date.now() }).catch(() => {});
+                    });
+                    return;
+                }
+                _posSocket.emit('pos:data-push', { device_id: posDeviceId, license_key: posmsKey, timestamp: new Date().toISOString(), ...delta });
+            }
+
+            async function initHybridStorage() {
+                await PesaDB.migrate();
+                const [prods, sls, custs, exps, supps] = await Promise.all([
+                    PesaDB.getAll('products'), PesaDB.getAll('sales'), PesaDB.getAll('customers'),
+                    PesaDB.getAll('expenses'),  PesaDB.getAll('suppliers'),
+                ]);
+                if (prods.length)  products   = prods;
+                if (sls.length)    sales       = sls;
+                if (custs.length)  customers   = custs;
+                if (exps.length)   expenses    = exps;
+                if (supps.length)  suppliers   = supps;
+                connectPosSocket();
+            }
+
             // ==================== UTILITY FUNCTIONS ====================
-            function saveProducts() { localStorage.setItem(STORAGE_PROD, JSON.stringify(products)); }
-            function saveSales() { localStorage.setItem('profitpoint_sales', JSON.stringify(sales)); }
-            function saveExpenses() { localStorage.setItem('profitpoint_expenses', JSON.stringify(expenses)); }
-            function saveCustomers() { localStorage.setItem('profitpoint_customers', JSON.stringify(customers)); }
-            function saveSuppliers() { localStorage.setItem('profitpoint_suppliers', JSON.stringify(suppliers)); }
-            function savePurchaseOrders() { localStorage.setItem('profitpoint_purchase_orders', JSON.stringify(purchaseOrders)); }
-            function saveShifts() { localStorage.setItem('profitpoint_shifts', JSON.stringify(shifts)); }
+            function saveProducts()  { localStorage.setItem(STORAGE_PROD, JSON.stringify(products)); PesaDB.put('products', products); if (!_receivingSocketData) socketPushData({ products }); }
+            function saveSales()     { localStorage.setItem('profitpoint_sales', JSON.stringify(sales)); PesaDB.put('sales', sales); if (!_receivingSocketData) socketPushData({ sales }); }
+            function saveExpenses()  { localStorage.setItem('profitpoint_expenses', JSON.stringify(expenses)); PesaDB.put('expenses', expenses); if (!_receivingSocketData) socketPushData({ expenses }); }
+            function saveCustomers() { localStorage.setItem('profitpoint_customers', JSON.stringify(customers)); PesaDB.put('customers', customers); if (!_receivingSocketData) socketPushData({ customers }); }
+            function saveSuppliers() { localStorage.setItem('profitpoint_suppliers', JSON.stringify(suppliers)); PesaDB.put('suppliers', suppliers); if (!_receivingSocketData) socketPushData({ suppliers }); }
+            function savePurchaseOrders() { localStorage.setItem('profitpoint_purchase_orders', JSON.stringify(purchaseOrders)); PesaDB.put('purchaseOrders', purchaseOrders); }
+            function saveShifts()    { localStorage.setItem('profitpoint_shifts', JSON.stringify(shifts)); PesaDB.put('shifts', shifts); }
             function saveAuditLogs() { localStorage.setItem('profitpoint_audit_logs', JSON.stringify(auditLogs)); }
             function saveNotifications() { localStorage.setItem('profitpoint_notifications', JSON.stringify(notifications)); }
-            function saveUsers() { localStorage.setItem(USERS_KEY, JSON.stringify(users)); }
-            function saveBrand() { localStorage.setItem('profitpoint_brand', JSON.stringify(shopBrand)); }
-            function saveCart() { localStorage.setItem('profitpoint_cart', JSON.stringify(cart)); }
+            function saveUsers()     { localStorage.setItem(USERS_KEY, JSON.stringify(users)); PesaDB.put('users', users); }
+            function saveBrand()     { localStorage.setItem('profitpoint_brand', JSON.stringify(shopBrand)); }
+            function saveCart()      { localStorage.setItem('profitpoint_cart', JSON.stringify(cart)); }
             function saveWallpaper() { localStorage.setItem('profitpoint_wallpaper', wallpaperImage); }
             function saveWallpaperOpacity(v) { localStorage.setItem('profitpoint_wallpaper_opacity', v); }
-            function saveReceiptSettings() { localStorage.setItem('profitpoint_receipt_settings', JSON.stringify(receiptSettings)); }
-            function saveLoyaltySettings() { localStorage.setItem('profitpoint_loyalty_settings', JSON.stringify(loyaltySettings)); }
-            function saveRecentProducts() { localStorage.setItem('profitpoint_recent_products', JSON.stringify(recentProductIds.slice(0, 12))); }
+            function saveReceiptSettings()  { localStorage.setItem('profitpoint_receipt_settings', JSON.stringify(receiptSettings)); }
+            function saveLoyaltySettings()  { localStorage.setItem('profitpoint_loyalty_settings', JSON.stringify(loyaltySettings)); }
+            function saveRecentProducts()   { localStorage.setItem('profitpoint_recent_products', JSON.stringify(recentProductIds.slice(0, 12))); }
             function saveFullscreenPreference() { localStorage.setItem(FULLSCREEN_PREF_KEY, shouldAutoFullscreen ? '1' : '0'); }
 
             function formatMoney(value) {
@@ -10572,7 +10704,8 @@
                 });
             }
 
-            setTimeout(() => {
+            setTimeout(async () => {
+                await initHybridStorage();
                 if (!splash) {
                     completeStartup();
                     return;
